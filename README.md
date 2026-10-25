@@ -11,10 +11,11 @@
 
 ## 📋 Table of Contents
 1. [Block Diagram & Timing](#-block-diagram--timing)
-2. [Verification Scenario](#-verification-scenario)
-3. [Testbench Code](#-testbench-code)
-4. [Simulation](#-simulation)
-5. [Troubleshooting](#-troubleshooting)
+2. [DUT Overview](#-dut-overview)
+3. [Verification Scenario](#-verification-scenario)
+4. [Testbench Code](#-testbench-code)
+5. [Simulation](#-simulation)
+6. [Troubleshooting](#-troubleshooting)
 
 ---
 
@@ -33,7 +34,7 @@ UART RX 입력(Start bit + D0~D7 + Stop bit)이 들어오면 `w_rx_done`과 함�
 </p>
 
 * UART는 **LSB first**로 전송합니다. 예를 들어 `0x31 (0011_0001)`은 선로에 `1000_1100` 순서로 나갑니다.
-* 테스트벤치의 `baud_tick = 10416`은 클럭(`always #5 clk = ~clk`, 100 MHz) 기준 1비트 구간의 클럭 수이며, 약 9600 baud에 해당합니다.
+* 100 MHz 클럭, **9600 baud**, **16배 오버샘플링** 구조입니다. `baud_tickgen`이 651클럭(= 100,000,000 / (9600 × 16))마다 `b_tick`을 내고, 1비트는 16 tick(= 651 × 16 = 10,416클럭)입니다. 테스트벤치의 `baud_tick = 10416`이 이 1비트 구간에 해당합니다.
 
 <p align="center">
   <img src="docs/tb_wave_overview.png" alt="Testbench waveform: 0x31 transmitted LSB first" width="85%">
@@ -41,6 +42,36 @@ UART RX 입력(Start bit + D0~D7 + Stop bit)이 들어오면 `w_rx_done`과 함�
 <p align="center">
   <img src="docs/tb_wave_zoom.png" alt="Zoomed waveform of rx data passing through FIFO" width="85%">
 </p>
+
+---
+
+## 🔩 DUT Overview
+
+| 모듈 | 역할 |
+| :--- | :--- |
+| `uart_top` | 최상위. `uart_rx → fifo_rx → fifo_tx → uart_tx` 루프백을 구성하고 `rx_data`, `rx_done`을 외부로 출력 |
+| `baud_tickgen` | `9600 × 16` 기준 `b_tick` 생성 (`F_COUNT = 100_000_000 / (9600 × 16) = 651`클럭마다 1 tick) |
+| `uart_rx` | FSM `IDLE → START → DATA → STOP`. Start bit 감지 후 **8 tick**을 세어 비트 중앙에 맞추고, 이후 **16 tick마다** 1비트를 샘플링해 `buf_reg`에 LSB부터 shift-in. 수신이 끝나면 `rx_done` 출력 |
+| `uart_tx` | FSM `IDLE → START → DATA → STOP`. `tx_start`가 오면 `tx_data`를 내부 버퍼에 잡아두고(`busy` 표시), 비트당 16 tick씩 LSB부터 송출 |
+| `fifo` | `DEPTH = 4`, `BIT_WIDTH = 8`. `register_file`(저장소, 리셋 없음)과 `control_unit`(`wptr` / `rptr` / `full` / `empty`)으로 구성 |
+
+**FIFO 제어(`control_unit`)** — `{push, pop}` 조합별로 포인터를 갱신합니다.
+
+| `{push, pop}` | 동작 |
+| :---: | :--- |
+| `10` | `full`이 아니면 `wptr` 증가, `empty` 해제, 다음 `wptr`가 `rptr`와 같아지면 `full` |
+| `01` | `empty`가 아니면 `rptr` 증가, `full` 해제, 다음 `rptr`가 `wptr`와 같아지면 `empty` |
+| `11` | `full`이면 read만, `empty`이면 write만, 그 외에는 `wptr` / `rptr` 둘 다 증가 |
+
+**`uart_top` 연결**
+
+| 인스턴스 | 핵심 연결 |
+| :--- | :--- |
+| `U_FIFO_RX` | `push = w_rx_done`, `push_data = w_rx_data`, `pop = ~w_tx_fifo_full` |
+| `U_FIFO_TX` | `push = ~w_rx_fifo_empty`, `push_data = w_rx_fifo_pop_data`, `pop = ~w_tx_busy` |
+| `U_UART_TX` | `tx_start = ~w_tx_fifo_empty`, `tx_data = w_tx_fifo_pop_data` |
+
+> `register_file`은 리셋이 없는 메모리라 첫 write 전에는 `pop_data`가 `XX`로 보이는 것이 정상입니다.
 
 ---
 
@@ -128,7 +159,7 @@ reg_reset_check :
 assert property (Preset_check)
 else $display("%t : Assert error : reset check", $time);
 
-// b_tick 은 reset 이 아닐 때 baud_tick(10416 클럭) 주기로 반복되어야 한다
+// reset 이 아닐 때 b_tick 이 발생하면 1비트 시간(10416 클럭) 뒤에도 b_tick 이 다시 발생해야 한다
 property B_TICK_check;
     @(posedge clk) disable iff (reset) b_tick |-> ##(10416) b_tick;
 endproperty
@@ -223,7 +254,7 @@ Assertion이 실제로 동작하는지 확인하기 위해 테스트벤치에서
 
 | # | 문제 현상 (Issue) | 원인 및 해결 |
 | --- | --- | --- |
-| **1** | _(PPT의 Trouble shooting 파형 / 로그를 설명해 주세요)_ | _(원인 및 해결 과정을 직접 작성해 주세요)_ |
+| **1** | **Loopback 데이터가 테스트벤치에서 정상 관측되지 않음** — 파형에서 `rx_data`와 FIFO `pop_data`가 `XX`로 남고, 로그에서 `output = 00x`, `rx_done = x`가 출력되며 여러 입력값(`0xA5`, `0xF3`, `0x33`)이 같은 시각에 겹쳐 찍힘 | **원인**: UART 비트 타이밍과 FIFO / `tx_busy` handshake 시점이 맞지 않아, 수신 완료(`rx_done`)·FIFO push/pop·송신 시작 시점이 어긋난 것으로 판단 <br><br> **해결**: <br> ① **TB** — Driver와 Monitor를 UART 프로토콜에 맞춰 `baud_tick`(1비트 = 10416클럭) 단위로 동작시키고, Monitor는 Start bit 인식 후 `baud_tick / 2`를 기다려 **비트 중앙을 샘플링** <br> ② **UART** — `uart_rx`는 Start bit 이후 8 tick으로 중앙을 맞추고 16 tick마다 샘플링, `uart_tx`는 비트당 16 tick으로 송출 <br> ③ **FIFO** — `{push, pop}` 동시 발생 시 `full`이면 read만, `empty`이면 write만 증가하도록 포인터 갱신 <br> ④ **연결** — `tx_start = ~tx_fifo_empty`, `FIFO_TX.pop = ~tx_busy`, `FIFO_RX.pop = ~tx_fifo_full`로 FIFO 상태와 `tx_busy`로 흐름 제어 |
 
 <details>
 <summary><b>Troubleshooting 당시 파형 및 로그</b></summary>
